@@ -1,0 +1,464 @@
+#!/usr/bin/env perl
+# -*- mode: perl -*-
+# -*- coding: utf-8 -*-
+# vi: set ft=perl :
+#
+# MySQL Data Chunk Script
+#
+# The most popular DBA script for MySQL who; Percona ToolKit, MySQL Utilities,
+# MyTop, InnoTOP, and MySQLTuner is written in Perl, because I chose that.
+#
+# This script is compatibility with MySQL, MariaDB and Percona.
+#
+# This is is mature, proven in the real world, and well tested, but all database
+# tools can pose a risk to the system and the database server. Before using this
+# tool, please:
+#
+#  - Read the tool’s documentation
+#  - Review the tool’s known "BUGS"
+#  - Test the tool on a non-production server
+#  - Backup your data in production server before run this script.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# This project would not be possible without help from:
+# - Nicola Strappazzon Carotenuto nicola@swapbytes.com
+#
+# TODO:
+# =====
+# - Add parameter to --ask-pass.
+# - Reverse chunk process.
+# - Replication lag detection to wait n seconds or reduce chunk.
+#   --slaves=dsn
+# - Add pid control to prevent the same execution command.
+# - Add parameter to --execute statement, is a another option of use template.
+# - Backup data changed.
+# - Show warnings.
+# - Add test for this.
+# - Load data form file.
+#   --columns=a,b,c Especificamos las columnas a insertar según el archivo.
+#   --data=file.csv
+# - Interrup process and wait to complete last execution and show last ID.
+#
+
+use strict;
+use warnings FATAL => 'all';
+use Getopt::Long;
+use POSIX;
+use Time::HiRes;
+
+eval {
+  require DBI;
+};
+
+if ( $@ ) {
+  die "Perl DBI module id not installed. \n"
+    . "  Debian/Ubuntu apt-get install libdbi-perl\n"
+    . "  RHEL/CentOS   yum install perl-DBI\n";
+}
+
+# --- Define command line ------------------------------------------------------
+our $VERSION = '0.3.0';
+my $OPTIONS = <<"_OPTIONS";
+
+MySQL Data Chunk Script
+
+$0 Ver $VERSION
+
+Usage: $0 --schema=sakila --table=film --key=film_id --template=template.txt
+
+  -?, --help           Display this help-screen and exit
+  -u, --user=#         User name for database login
+  -p, --password=#     Password for database login
+  -h, --host=#         Hostname to connecting to the server
+  -P, --port=#         Port nomber to connecting to the server
+  -d, --schema=#       Schema name
+  -T, --table=#        Table name to chunk
+  -t, --template=#     SQL template file
+  -k, --key=#          Primary Key name
+  -f  --fileids=#      File with Primary/Foreign Key list
+  -S, --sleep=#        Time sleep between chunk
+  -c, --chunk=#        Define chunk size
+  -s, --start=#        Start chunk from ID
+  -e, --end=#          End chunk to ID
+      --dry-run        Run in test mode (autocommit=0)
+      --debug          Debug mode.
+
+SQL Template example:
+
+  UPDATE [TABLE] SET last_update = NOW() WHERE film_id BETWEEN [START] AND [END];
+
+  UPDATE [TABLE] SET last_update = NOW() WHERE film_id IN ([FILE_IDS]);
+
+SQL Template Variables:
+
+  - [TABLE]    Table name when apply UPDATE or DELETE or INSERT
+  - [START]    Primary Key (ID) to start on table.
+  - [END]      Primary Key (ID) to end on table.
+  - [FILE_IDS] Chunk list of Primary/Foreign KEY from file. (--file-ids)
+
+_OPTIONS
+
+my %opt = (
+  "host"  => "127.0.0.1",
+  "user"  => "root",
+  "port"  => 3306,
+  "sleep" => 1,
+  "chunk" => 1000,
+  "start" => 0,
+  "end"   => 0,
+  "key"   => "id",
+);
+
+# Disambiguate -p and -P
+Getopt::Long::Configure(qw(no_ignore_case));
+
+GetOptions(\%opt,
+  "help",
+  "dry-run",
+  "debug",
+  "host|h=s",
+  "user|u=s",
+  "password|p=s",
+  "port|P=i",
+  "table|T=s",
+  "template|t=s",
+  "key|k=s",
+  "fileids|f=s",
+  "schema|d=s",
+  "sleep|S=f",
+  "chunk|c=i",
+  "start|s=i",
+  "end|e=i",
+) or usage("Invalid option");
+
+usage() if ($opt{help});
+
+# --- Validate required parameter ----------------------------------------------
+unless (
+  defined $opt{schema}   &&
+  defined $opt{table}    &&
+  defined $opt{template}
+) {
+  usage();
+}
+
+# Validar combinacion de variables:
+# if file_ids > 0 no puede haber definido start ni end.
+
+# --- Define basic variables ---------------------------------------------------
+my $chunk_duration       = 0;
+my $chunk_eta            = 0;
+my $chunk_end            = 0;
+my $chunk_end_time       = 0;
+my $chunk_percentage     = 0;
+my $chunk_start          = 0;
+my $chunk_start_time     = 0;
+my $chunk_total          = 0;
+my $dsn                  = '';
+my $row_count            = 0;
+my $row_delta            = 0;
+my $row_total            = 0;
+my $row_affected         = 0;
+my $sql_count            = '';
+my $sql_template         = '';
+my $sql                  = '';
+my $sth;
+my $table                = $opt{table};
+my $file_template        = '';
+my $file_handle_template;
+my $file_ids             = '';
+my $file_ids_count       = 0;
+my $file_handle_ids;
+
+# --- Read ID's from file ------------------------------------------------------
+if (length($opt{fileids}) > 0) {
+  open $file_handle_ids, '<', $opt{fileids} or die "Could not open file with in ID's: $opt{file_ids}\n";
+
+  print "Waiting...\n";
+
+  while( my $line = <$file_handle_ids>) {
+    $line =~ s/[\r\n]+//g;
+
+    if ($line =~ /^[+-]?\d+$/ ) {
+      ++$file_ids_count;
+    }
+  }
+  close $file_handle_ids;
+}
+
+# --- Prepare SQL from template ------------------------------------------------
+#
+# Load template from file
+open $file_handle_template, '<', $opt{template} or die "Could not open template: $opt{template}\n";
+
+$file_template = do { local $/; <$file_handle_template> };
+
+# Clear string
+$sql_template = join(' ', $file_template);
+$sql_template =~ s/\n/ /g;
+$sql_template =~ s/ +/ /g;
+
+# Validate template
+if (index($sql_template, '[TABLE]') == -1) {
+  die "SQL template not contain [TABLE] variable.\n";
+}
+
+if ($file_ids_count > 0) {
+  if (index($sql_template, '[FILE_IDS]') == -1) {
+    die "SQL template not contain [FILE_IDS] variable.\n";
+  }
+
+  if (index($sql_template, '[START]') == 0) {
+    die "SQL template has contain [START] variable, please remove it.\n";
+  }
+
+  if (index($sql_template, '[END]') == 0) {
+    die "SQL template has contain [END] variable, please remove it.\n";
+  }
+} else {
+  if (index($sql_template, '[START]') == -1) {
+    die "SQL template not contain [START] variable.\n";
+  }
+
+  if (index($sql_template, '[END]') == -1) {
+    die "SQL template not contain [END] variable.\n";
+  }
+}
+
+# --- Connect to the database --------------------------------------------------
+my $dbh;
+my $autocommit = 1;
+
+$dsn  = ";host=$opt{host}";
+$dsn .= ";port=$opt{port}";
+$dsn .= ";database=$opt{schema}";
+
+if ($opt{'dry-run'}) {
+  $autocommit = 0;
+}
+
+eval {
+  $dbh = DBI->connect("dbi:mysql:$dsn;", $opt{user}, $opt{password},
+  {
+    RaiseError => 0,
+    PrintError => 0,
+    AutoCommit => $autocommit,
+  }) or die $DBI::errstr . "\n";
+};
+
+if ( $@ =~ m/locate DBD\/mysql/i ) {
+  die "Perl DBI::mysql module id not installed. \n"
+    . "  Debian/Ubuntu apt-get install libdbd-mysql-perl\n"
+    . "  RHEL/CentOS   yum install perl-DBD-MySQL\n";
+}
+
+# --- Calculate loop -----------------------------------------------------------
+if ($file_ids_count > 0) {
+  $row_count = $file_ids_count;
+} else {
+  $sql_count = "SELECT MAX($opt{key}) FROM $opt{schema}.$opt{table}";
+
+  $sth = $dbh->prepare($sql_count);
+  $sth->execute or die "SQL Error: $DBI::errstr\n";
+  $row_count = $sth->fetchrow_array();
+  $sth->finish;
+}
+
+$row_delta   = $opt{chunk} * 2;
+$row_total   = $row_count + $row_delta;
+$chunk_total = ceil($row_total / $opt{chunk});
+
+&info("Max rows in table/file: $row_count, Delta: $row_delta, Total: $row_total, Chunk size: $opt{chunk}, Number of chunks: $chunk_total");
+# Ignorar este debug
+&debug($sql_count);
+
+# --- Chunk loop ---------------------------------------------------------------
+if ($file_ids_count > 0) {
+  open $file_handle_ids, '<', $opt{fileids} or die "Could not open file with in ID's: $opt{file_ids}\n";
+
+  my @ids = ();
+  my $count = 0;
+  my $chunk_position = 1;
+  my $in = "";
+
+  while( my $line = <$file_handle_ids>)  {
+    # Get start of execution time
+    $chunk_start_time = time;
+
+    # Clear line
+    $line =~ s/[\r\n]+//g;
+
+    # Check the value line is number and add to array
+    if ($line =~ /^[+-]?\d+$/ ) {
+      push @ids, $line;
+    }
+
+    if (++$count == $opt{chunk}) {
+      $chunk_position++;
+      $in = join(',', @ids);
+      $count = 0;
+      @ids = ();
+
+      # Calculate chunk
+      $chunk_start      = (($chunk_position * $opt{chunk}) - $opt{chunk}) + 1;
+      $chunk_end        = ($chunk_position * $opt{chunk});
+      $chunk_percentage = ((100 * $chunk_position) / $chunk_total);
+      $chunk_percentage = sprintf("%.0f", $chunk_percentage);
+
+      # Resume process with start and end table id
+      if ($opt{start} > 0 && $chunk_end <= $opt{start}) {
+        # &log($chunk_position, $chunk_percentage, $chunk_start, $chunk_end, 'Ignored!');
+        next;
+      }
+
+      if ($opt{end} > 0 && $chunk_start > $opt{end}) {
+        # &log($chunk_position, $chunk_percentage, $chunk_start, $chunk_end, 'Ignored!');
+        next;
+      }
+
+      # Add variables into template
+      $sql = $sql_template;
+      $sql =~ s/\[TABLE\]/$table/g;
+      $sql =~ s/\[FILE_IDS\]/$in/g;
+
+      # Execute query
+      &log($chunk_position, $chunk_percentage, $chunk_eta, $chunk_start, $chunk_end);
+      &debug($sql);
+
+      $sth = $dbh->prepare($sql);
+      $sth->execute or die "SQL: $sql\nSQL Error: $DBI::errstr\n";
+      $row_affected += $sth->rows;
+
+      &debug("Rows Matched: " . $sth->rows);
+
+      # Wait N seconds
+      Time::HiRes::sleep($opt{sleep});
+
+      # Calculate execution time:
+      $chunk_end_time = time - $chunk_start_time;
+      $chunk_duration = ceil(($chunk_end_time + $chunk_duration) / 2);
+      $chunk_eta      = (($chunk_total - $chunk_position) - 1) * $chunk_duration;
+    }
+  }
+
+  close $file_handle_ids;
+} else {
+  for (my $chunk_position=1; $chunk_position <= $chunk_total; $chunk_position++) {
+    # Get start of execution time
+    $chunk_start_time = time;
+
+    # Calculate chunk
+    $chunk_start      = (($chunk_position * $opt{chunk}) - $opt{chunk}) + 1;
+    $chunk_end        = ($chunk_position * $opt{chunk});
+    $chunk_percentage = ((100 * $chunk_position) / $chunk_total);
+    $chunk_percentage = sprintf("%.0f", $chunk_percentage);
+
+    # Resume process with start and end table id
+    if ($opt{start} > 0 && $chunk_end <= $opt{start}) {
+      # &log($chunk_position, $chunk_percentage, $chunk_start, $chunk_end, 'Ignored!');
+      next;
+    }
+
+    if ($opt{end} > 0 && $chunk_start > $opt{end}) {
+      # &log($chunk_position, $chunk_percentage, $chunk_start, $chunk_end, 'Ignored!');
+      next;
+    }
+
+    # Add variables into template
+    $sql = $sql_template;
+    $sql =~ s/\[TABLE\]/$table/g;
+    $sql =~ s/\[START\]/$chunk_start/g;
+    $sql =~ s/\[END\]/$chunk_end/g;
+
+    # Execute query
+    &log($chunk_position, $chunk_percentage, $chunk_eta, $chunk_start, $chunk_end);
+    &debug($sql);
+
+    $sth = $dbh->prepare($sql);
+    $sth->execute or die "SQL: $sql\nSQL Error: $DBI::errstr\n";
+    $row_affected += $sth->rows;
+
+    &debug("Rows Matched: " . $sth->rows);
+
+    # Wait N seconds
+    Time::HiRes::sleep($opt{sleep});
+
+    # Calculate execution time:
+    $chunk_end_time = time - $chunk_start_time;
+    $chunk_duration = ceil(($chunk_end_time + $chunk_duration) / 2);
+    $chunk_eta      = (($chunk_total - $chunk_position) - 1) * $chunk_duration;
+  }
+}
+
+# --- Summary ------------------------------------------------------------------
+&summary("Total rows affected: $row_affected");
+
+# --- Disconnect from the MySQL database ---------------------------------------
+$dbh->disconnect;
+
+# --- Start subroutine ---------------------------------------------------------
+sub usage {
+  die @_, $OPTIONS;
+}
+
+sub chunk {
+
+}
+
+sub summary {
+  my ($message) = @_;
+  my $timestamp = strftime "%Y/%m/%d %H:%M:%S", localtime;
+
+  print "$timestamp -- Chunk Summary: $message\n";
+}
+
+sub info {
+  my ($message) = @_;
+  my $timestamp = strftime "%Y/%m/%d %H:%M:%S", localtime;
+
+  print "$timestamp -- Chunk Info: $message\n";
+}
+
+sub debug {
+  my ($sql) = @_;
+
+  if ($opt{debug}) {
+    print ' ' x 23;
+    print "Debug: $sql\n";
+  }
+}
+
+sub log {
+  my ($chunk, $percentage, $eta, $start, $end) = @_;
+  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime();
+
+  my $timestamp;
+
+  my $hours   = int( $eta / (60*60));
+  my $minutes = int(($eta - $hours*60*60) / (60));
+  my $seconds = int( $eta - ($hours*60*60) - ($minutes*60));
+
+  $hours      = sprintf("%.2d", $hours);
+  $minutes    = sprintf("%.2d", $minutes);
+  $seconds    = sprintf("%.2d", $seconds);
+  $chunk      = sprintf("%*d", length($chunk_total), $chunk);
+  $end        = sprintf("%*d", length($row_total), $end);
+  $start      = sprintf("%*d", length($row_total), $start);
+  $percentage = sprintf("%3d", $percentage);
+  $timestamp  = strftime "%Y/%m/%d %H:%M:%S", localtime;
+  $eta        = "$hours:$minutes:$seconds";
+
+  print "$timestamp -- Chunk: $chunk/$chunk_total, $percentage%, ETA: $eta ($start, $end)\n";
+}
