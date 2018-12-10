@@ -1,5 +1,6 @@
-# MySQLDataChunk
-MySQL Tool to modify big lot of data on table without blocking
+# Chainsaw
+
+MySQL Tool to modify big lot of data on table without blocking. The secret is modify by chunks and wait between chunks.
 
 ## Install
 
