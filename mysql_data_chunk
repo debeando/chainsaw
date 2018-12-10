@@ -46,9 +46,6 @@
 # - Backup data changed.
 # - Show warnings.
 # - Add test for this.
-# - Load data form file.
-#   --columns=a,b,c Especificamos las columnas a insertar según el archivo.
-#   --data=file.csv
 # - Interrup process and wait to complete last execution and show last ID.
 #
 
