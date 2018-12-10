@@ -183,7 +183,7 @@ my $file_ids_count       = 0;
 my $file_handle_ids;
 
 # --- Read ID's from file ------------------------------------------------------
-if (length($opt{fileids}) > 0) {
+if (defined $opt{fileids} && length($opt{fileids}) > 0) {
   open $file_handle_ids, '<', $opt{fileids} or die "Could not open file with in ID's: $opt{file_ids}\n";
 
   print "Waiting...\n";

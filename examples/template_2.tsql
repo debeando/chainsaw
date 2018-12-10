@@ -1,0 +1,1 @@
+UPDATE [TABLE] SET status = 2 WHERE status = 1 AND id IN ([FILE_IDS])
