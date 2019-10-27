@@ -2,8 +2,9 @@ package main
 
 import (
 	"fmt"
-	"time"
+	"math"
 	"strconv"
+	"time"
 )
 
 type Chunk struct {
@@ -25,41 +26,105 @@ type Chunk struct {
 }
 
 func main() {
-	c := Chunk{Count: 1000, Delta: 0, Length: 100, Start: 1, Sleep: 1 * time.Second}
+	c := Chunk{Count: 500, Delta: 50, Length: 100, Start: 1, Sleep: 1 * time.Second}
 	c.Loop(func(){
-		time.Sleep(1 * time.Second)
+		// time.Sleep(1 * time.Second)
+		c.Log()
 	})
 }
 
-func (c *Chunk) Calculate() {
-	c.Total      = c.Count + c.Delta
-	c.Steps      = c.Total / c.Length
+func (c *Chunk) SetTotal() {
+	c.Total = c.Count + c.Delta
+}
+
+func (c *Chunk) SetSteps() {
+	c.Steps = DivisionAndRound(c.Total, c.Length)
+}
+
+func (c *Chunk) SetProgress() {
 	c.Percentage = ((100 * c.Index) / c.Total)
-	c.Duration   = c.EndTime.Sub(c.StartTime)
-	c.Remain     = (c.Total - c.Index) / c.Length
-	c.ETA        = time.Duration(c.Remain) * c.Duration
+}
+
+func (c *Chunk) SetRemain() {
+	c.Remain = DivisionAndRound(c.Total - c.Index, c.Length)
+}
+
+func (c *Chunk) SetEnd() {
+	c.End = c.Index
+}
+
+func (c *Chunk) SetStart() {
+	c.Start = c.Index - (c.Length - 1)
+
+	if c.Index >= c.Total {
+		c.Start = c.Count + 1
+	}
+}
+
+func (c *Chunk) SetDuration() {
+	c.Duration = c.EndTime.Sub(c.StartTime)
+}
+
+func (c *Chunk) SetETA() {
+	c.ETA = time.Duration(c.Remain) * c.Duration
+}
+
+func (c *Chunk) SetStartTime() {
+	c.StartTime = time.Now()
+}
+
+func (c *Chunk) SetEndTime() {
+	c.EndTime = time.Now()
+}
+
+func (c *Chunk) Wait() {
+	time.Sleep(c.Sleep)
+}
+
+func (c *Chunk) SetIncrement() {
+	c.Index = c.Index + c.Length
+
+	if (c.Index + c.Length) > c.Total {
+		c.Index = c.Total
+	}
 }
 
 func (c *Chunk) Loop(f interface{}) {
-	c.Calculate()
-	for i := c.Start; i <= c.Total; i++ {
-		if i % c.Length == 0 {
-			c.StartTime = time.Now()
+	c.Index  = 0
+	c.Start  = 0
 
-			f.(func())()
+	c.SetTotal()
+	c.SetSteps()
 
-			time.Sleep(c.Sleep)
-
-			c.EndTime = time.Now()
-			c.Index   = i
-			c.Calculate()
-			c.Log()
-		}
+	for c.Index = c.Start; c.Index < c.Total; {
+		c.SetIncrement()
+		c.SetProgress()
+		c.SetRemain()
+		c.SetEnd()
+		c.SetStart()
+		c.SetDuration()
+		c.SetETA()
+		c.SetStartTime()
+		f.(func())()
+		c.Wait()
+		c.SetEndTime()
 	}
 }
 
 func (c *Chunk) Log() {
-	fmt.Printf("%*d %*d/%d %3d%% %.fs\n", IntLength(c.Steps - 1), c.Remain, IntLength(c.Total), c.Index, c.Total, c.Percentage, c.ETA.Seconds())
+	fmt.Printf("%*d %*d/%d [%*d-%*d] %3d%% %.fs\n",
+		IntLength(c.Steps),
+		c.Remain,
+		IntLength(c.Total),
+		c.Index,
+		c.Total,
+		IntLength(c.Total),
+		c.Start,
+		IntLength(c.Total),
+		c.End,
+		c.Percentage,
+		c.ETA.Seconds(),
+	)
 }
 
 func IntLength(v uint64) int {
@@ -69,3 +134,10 @@ func IntLength(v uint64) int {
 func Int64ToString(v uint64) string {
 	return strconv.FormatUint(v, 10)
 }
+
+func DivisionAndRound(x uint64, y uint64) uint64 {
+	return uint64(math.Round(float64(x) / float64(y)))
+}
+
+// los ficheros a subir al S3 podrian tener este formato:
+// ddbb_table_date_chunk
