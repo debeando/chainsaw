@@ -1,0 +1,6 @@
+*.test
+.DS_Store
+chainsaw
+Gopkg.lock
+pkg/
+vendor/

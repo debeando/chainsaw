@@ -1,1 +1,0 @@
-UPDATE [TABLE] SET status = 1 WHERE id BETWEEN [START] AND [END] AND status <> 1
